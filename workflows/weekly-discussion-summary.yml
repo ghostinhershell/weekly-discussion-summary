@@ -1,0 +1,111 @@
+name: Weekly Discussion Summary
+
+on:
+  schedule:
+    - cron: "0 0 * * 0" # Runs every Sunday at midnight UTC
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  fetch-summarize-create:
+    name: Fetch Discussions, Summarize, and Create Issue
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout Repository
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      # Step 2: Fetch Discussions from Community
+      - name: Fetch Discussions from "Pull Requests" Category
+        id: fetch_discussions
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          START_DATE=$(date -u -d "7 days ago" +%Y-%m-%dT%H:%M:%SZ)
+          END_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          # Fetch discussions using the GITHUB_TOKEN
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/orgs/community/discussions?category_id=pull-requests&since=$START_DATE&until=$END_DATE")
+
+          if [ $? -ne 0 ]; then
+            echo "Error fetching discussions"
+            echo "discussions_output=[]" >> $GITHUB_ENV
+          else
+            echo "discussions_output=$RESPONSE" >> $GITHUB_ENV
+          fi
+
+      # Step 3: Analyze and Prioritize Discussions
+      - name: Analyze and Prioritize Discussions
+        id: analyze_discussions
+        run: |
+          DISCUSSIONS=${{ env.discussions_output }}
+          if [ -z "$DISCUSSIONS" ] || [ "$DISCUSSIONS" == "[]" ]; then
+            SUMMARY="No discussions were found for the past week."
+          else
+            PRIORITIZED_DISCUSSIONS="### Weekly Summary of Discussions\n\n"
+            CALL_TO_ACTION="### Call to Action\n\n"
+
+            for DISCUSSION in $(echo $DISCUSSIONS | jq -c '.[]'); do
+              TITLE=$(echo $DISCUSSION | jq -r '.title')
+              URL=$(echo $DISCUSSION | jq -r '.html_url')
+              COMMENTS=$(echo $DISCUSSION | jq -r '.comments')
+              REACTIONS=$(echo $DISCUSSION | jq -r '.reactions.total_count')
+
+              # Prioritize based on engagement
+              if [ "$REACTIONS" -ge 10 ] || [ "$COMMENTS" -ge 5 ]; then
+                PRIORITIZED_DISCUSSIONS+="* **High Priority**: [${TITLE}](${URL}) - ${COMMENTS} comments, ${REACTIONS} reactions\n"
+              else
+                CALL_TO_ACTION+="* [${TITLE}](${URL}) - ${COMMENTS} comments, ${REACTIONS} reactions\n"
+              fi
+            done
+
+            SUMMARY="$PRIORITIZED_DISCUSSIONS\n\n$CALL_TO_ACTION"
+          fi
+          echo "summary=$SUMMARY" >> $GITHUB_ENV
+
+      # Step 4: Save Logs for Long-Term Tracking
+      - name: Save Discussions Log
+        uses: actions/upload-artifact@v3
+        with:
+          name: discussions-log
+          path: ${{ env.discussions_output }}
+
+      # Step 5: Create an Issue in Summary Repo
+      - name: Create Weekly Summary Issue
+        id: create_issue
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          TITLE="Weekly Summary of Discussions - Week of $DATE"
+          BODY=${{ env.summary }}
+
+          # Check if the milestone exists and fetch its ID
+          MILESTONE_RESPONSE=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/ghostinhershell/weekly-discussion-summary/milestones")
+          MILESTONE_ID=$(echo "$MILESTONE_RESPONSE" | jq -r '.[] | select(.title=="Discussion Summaries") | .number')
+
+          if [ -z "$MILESTONE_ID" ]; then
+            echo "Milestone 'Discussion Summaries' not found. Please create it before running this workflow."
+            exit 1
+          fi
+
+          # Create the issue with enhanced labels and milestone
+          curl -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d '{
+              "title": "'"$TITLE"'",
+              "body": "'"$BODY"'",
+              "labels": ["weekly-summary", "automation", "high-priority"],
+              "milestone": '"$MILESTONE_ID"'
+            }' \
+            "https://api.github.com/repos/ghostinhershell/weekly-discussion-summary/issues"
+
+      # Step 6: Log Workflow Completion
+      - name: Log Workflow Completion
+        if: ${{ success() }}
+        run: |
+          echo "Weekly summary issue created successfully."
